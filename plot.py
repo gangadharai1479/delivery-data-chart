@@ -1,655 +1,566 @@
-import streamlit as st
+import io
+import datetime
+from datetime import date, timedelta
+
 import pandas as pd
-from datetime import datetime, timedelta
-from nselib import capital_market as cm
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import os, warnings, re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import numpy as np
 import requests
-from io import BytesIO, StringIO
-from zipfile import ZipFile
-
-warnings.filterwarnings("ignore")
-
-# ===== Class for Fast NSE Data Fetching with Caching =====
-class NSEVisualizer:
-    def __init__(self, cache_dir="nse_cache"):
-        self.data = None
-        self.cache_dir = cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
-
-    def _cache_path(self, symbol, start_date, end_date):
-        return os.path.join(self.cache_dir, f"{symbol}_{start_date}_to_{end_date}.csv")
-
-    def fetch_data(self, symbol, start_date, end_date):
-        start_str = start_date.strftime('%Y-%m-%d')
-        end_str = end_date.strftime('%Y-%m-%d')
-        # Persistent per-symbol cache that grows over time
-        master_cache = os.path.join(self.cache_dir, f"{symbol}_master.csv")
-
-        cached_df = None
-        if os.path.exists(master_cache):
-            try:
-                cached_df = pd.read_csv(master_cache, parse_dates=["DATE"])
-                cached_df["DATE"] = pd.to_datetime(cached_df["DATE"]).dt.tz_localize(None)
-            except Exception:
-                cached_df = None
-
-        # Determine business dates we need
-        all_days = pd.date_range(start=start_date, end=end_date, freq="B")
-        missing_days = []
-        if cached_df is not None and not cached_df.empty:
-            known_dates = set(pd.to_datetime(cached_df["DATE"]).dt.normalize())
-            for d in all_days:
-                if d.normalize() not in known_dates:
-                    missing_days.append(d)
-        else:
-            missing_days = list(all_days)
-
-        # Fetch missing in parallel (bounded threads)
-        fetched_frames: list[pd.DataFrame] = []
-        if missing_days:
-            with ThreadPoolExecutor(max_workers=min(8, max(2, os.cpu_count() or 2))) as ex:
-                futures = [ex.submit(self._fetch_one_day_symbol, symbol, d) for d in missing_days]
-                for fut in as_completed(futures):
-                    try:
-                        df_day = fut.result()
-                        if df_day is not None and not df_day.empty:
-                            fetched_frames.append(df_day)
-                    except Exception:
-                        continue
-
-        if fetched_frames:
-            new_data = pd.concat(fetched_frames, ignore_index=True)
-            if cached_df is not None and not cached_df.empty:
-                combined = pd.concat([cached_df, new_data], ignore_index=True)
-            else:
-                combined = new_data
-            combined = (
-                combined.sort_values("DATE")
-                .drop_duplicates(subset=["DATE", "SYMBOL"], keep="last")
-                .reset_index(drop=True)
-            )
-            combined.to_csv(master_cache, index=False)
-            cached_df = combined
-
-        # Slice to requested window
-        if cached_df is None or cached_df.empty:
-            result = pd.DataFrame()
-        else:
-            mask = (cached_df["DATE"] >= pd.to_datetime(start_date)) & (
-                cached_df["DATE"] <= pd.to_datetime(end_date)
-            )
-            result = cached_df.loc[mask].copy()
-
-        self.data = result
-        return result
-
-    def _fetch_range(self, symbol, start_dt, end_dt):
-        # Kept for compatibility if called elsewhere; now unused by fetch_data
-        frames = []
-        for d in pd.date_range(start=start_dt, end=end_dt, freq="B"):
-            df = self._fetch_one_day_symbol(symbol, d)
-            if df is not None and not df.empty:
-                frames.append(df)
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-    def _fetch_one_day_symbol(self, symbol: str, date: pd.Timestamp):
-        try:
-            ds = pd.Timestamp(date).strftime("%d-%m-%Y")
-            # Primary: capital market bhavcopy_with_delivery
-            bhav = None
-            try:
-                bhav = cm.bhavcopy_with_delivery(ds)
-            except Exception:
-                bhav = None
-            if bhav is None or getattr(bhav, "empty", True):
-                bhav = self._fetch_from_nse_sec_bhav(pd.Timestamp(date).to_pydatetime())
-            if bhav is None or bhav.empty:
-                return None
-            if "SYMBOL" not in bhav.columns:
-                return None
-            bhav["SYMBOL"] = bhav["SYMBOL"].astype(str).str.strip().str.upper()
-            if "SERIES" in bhav.columns:
-                bhav["SERIES"] = bhav["SERIES"].astype(str).str.strip().str.upper()
-            sdata = bhav[bhav["SYMBOL"] == symbol.upper()]
-            if "SERIES" in bhav.columns:
-                sdata = sdata[sdata["SERIES"] == "EQ"]
-            if sdata.empty:
-                return None
-            sdata = sdata.copy()
-            sdata["DATE"] = pd.to_datetime(date)
-
-            # Derive delivery % if needed
-            qty_col = "TTL_TRD_QNTY" if "TTL_TRD_QNTY" in sdata.columns else ("TOT_TRD_QTY" if "TOT_TRD_QTY" in sdata.columns else None)
-            if "DELIV_PER" in sdata.columns:
-                sdata["DELIVERY_PCT"] = pd.to_numeric(sdata["DELIV_PER"], errors="coerce").round(2)
-            elif qty_col and "DELIV_QTY" in sdata.columns:
-                sdata["DELIVERY_PCT"] = (
-                    pd.to_numeric(sdata["DELIV_QTY"], errors="coerce") / pd.to_numeric(sdata[qty_col], errors="coerce") * 100
-                ).round(2)
-            else:
-                sdata["DELIVERY_PCT"] = pd.NA
-            return sdata
-        except Exception:
-            return None
-
-    def _fetch_from_nse_sec_bhav(self, dt: datetime) -> pd.DataFrame | None:
-        # Try daily sec_bhavdata_full CSV
-        url_daily = f"https://archives.nseindia.com/products/content/sec_bhavdata_full_{dt:%d%m%Y}.csv"
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-            )
-        }
-        try:
-            resp = requests.get(url_daily, headers=headers, timeout=20)
-            if resp.status_code == 200 and resp.text.strip():
-                df = pd.read_csv(StringIO(resp.text))
-                return self._normalize_sec_bhav_columns(df)
-        except Exception:
-            pass
-
-        # Try historical daily equity bhav zip (without delivery; only if sec file missing)
-        # Note: delivery% not available here; we'll return None to skip rather than partial data
-        return None
-
-    def _normalize_sec_bhav_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Normalize headers
-        def norm(c: str) -> str:
-            c = c.strip().upper()
-            c = re.sub(r"[^A-Z0-9]+", "_", c)
-            return c
-
-        df = df.rename(columns={c: norm(c) for c in df.columns})
-        # Common mappings
-        rename_map = {
-            "OPEN_PRICE": "OPEN",
-            "HIGH_PRICE": "HIGH",
-            "LOW_PRICE": "LOW",
-            "CLOSE_PRICE": "CLOSE",
-            "LAST_PRICE": "LAST",
-            "TOTAL_TRADES": "NO_OF_TRADES",
-            "TOTAL_TRADE_QUANTITY": "TOT_TRD_QTY",
-            "TOTAL_TRD_QTY": "TOT_TRD_QTY",
-            "DELIVERABLE_QUANTITY": "DELIV_QTY",
-            "DELIVERABLE_QTY": "DELIV_QTY",
-            "DELIVERABLE__QTY": "DELIV_QTY",
-            "DELIVERABLE_PERCENT": "DELIV_PER",
-            "DELIVERABLE_PERC": "DELIV_PER",
-        }
-        for k, v in list(rename_map.items()):
-            if k in df.columns and v not in df.columns:
-                df.rename(columns={k: v}, inplace=True)
-        # Ensure expected basic columns
-            return df
-
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
-def load_symbol_list() -> list[str]:
-    # NSE equity list (EQUITY_L.csv) – includes all tradable symbols
-    url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-        )
-    }
-    try:
-        df = pd.read_csv(url, headers=headers)
-    except Exception:
-        # Fallback via requests if pandas cannot pass headers param
-        resp = requests.get(url, headers=headers, timeout=20)
-        resp.raise_for_status()
-        from io import StringIO
-        df = pd.read_csv(StringIO(resp.text))
-    symbols = (
-        df.get("SYMBOL", pd.Series(dtype=str)).dropna().astype(str).str.upper().unique().tolist()
-    )
-    symbols.sort()
-    return symbols
+import streamlit as st
+from nselib import capital_market
 
 
-# ===== Custom CSS for Beautiful UI =====
-def apply_custom_css():
-    st.markdown("""
-    <style>
-    /* Main app styling */
-    .main .block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-        max-width: 1200px;
-    }
-    
-    /* Header styling */
+# Configure page with custom theme
+st.set_page_config(
+    page_title="NSE Bhavcopy Viewer",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    /* Main container styling */
     .main-header {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 2rem 2rem;
-        border-radius: 15px;
-        margin-bottom: 2rem;
-        box-shadow: 0 8px 32px rgba(102, 126, 234, 0.2);
-    }
-    
-    .main-header h1 {
+        background: linear-gradient(90deg, #1f4e79, #2e7d32);
+        padding: 1rem;
+        border-radius: 8px;
+        margin-bottom: 1rem;
         color: white;
-        font-size: 2.5rem;
-        font-weight: 700;
-        margin-bottom: 0.5rem;
-        text-align: center;
     }
     
-    .main-header p {
-        color: rgba(255, 255, 255, 0.9);
-        font-size: 1.2rem;
-        text-align: center;
-        margin: 0;
-    }
-    
-    /* Control panel styling */
-    .control-panel {
-        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-        padding: 2rem;
-        border-radius: 15px;
-        margin-bottom: 2rem;
-        box-shadow: 0 8px 32px rgba(240, 147, 251, 0.2);
-    }
-    
-    .control-panel .stSelectbox > label,
-    .control-panel .stNumberInput > label {
-        color: white;
-        font-weight: 600;
-        font-size: 1.1rem;
-    }
-    
-    /* Metric cards */
     .metric-container {
-        background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
-        padding: 2rem;
-        border-radius: 15px;
-        margin: 1rem 0;
-        box-shadow: 0 8px 32px rgba(252, 182, 159, 0.3);
+        background: #f8f9fa;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #2e7d32;
+        margin: 0.5rem 0;
     }
     
-    .metric-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-        gap: 1rem;
-        margin-top: 1rem;
-    }
-    
-    .metric-card {
-        background: rgba(255, 255, 255, 0.9);
+    .filter-section {
+        background: #ffffff;
         padding: 1.5rem;
-        border-radius: 12px;
-        text-align: center;
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
-        backdrop-filter: blur(10px);
-        border: 1px solid rgba(255, 255, 255, 0.2);
-    }
-    
-    .metric-label {
-        font-size: 0.9rem;
-        color: #666;
-        font-weight: 600;
-        margin-bottom: 0.5rem;
-    }
-    
-    .metric-value {
-        font-size: 1.8rem;
-        font-weight: 700;
-        color: #2c3e50;
-    }
-    
-    .metric-value.price {
-        color: #27ae60;
-    }
-    
-    .metric-value.percentage {
-        color: #e67e22;
-    }
-    
-    .metric-value.volatility {
-        color: #e74c3c;
-    }
-    
-    /* Chart container */
-    .chart-container {
-        background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
-        padding: 2rem;
-        border-radius: 15px;
-        margin: 2rem 0;
-        box-shadow: 0 8px 32px rgba(168, 237, 234, 0.3);
-    }
-    
-    /* Success/Error messages */
-    .stAlert > div {
-        border-radius: 12px;
-        border: none;
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
-    }
-    
-    /* Button styling */
-    .stButton > button {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        border: none;
-        border-radius: 25px;
-        padding: 0.75rem 2rem;
-        font-weight: 600;
-        font-size: 1.1rem;
-        box-shadow: 0 4px 16px rgba(102, 126, 234, 0.3);
-        transition: all 0.3s ease;
-        width: 100%;
-    }
-    
-    .stButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 8px 32px rgba(102, 126, 234, 0.4);
-    }
-    
-    /* Download button */
-    .stDownloadButton > button {
-        background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-        color: white;
-        border: none;
-        border-radius: 25px;
-        padding: 0.75rem 2rem;
-        font-weight: 600;
-        box-shadow: 0 4px 16px rgba(79, 172, 254, 0.3);
-        transition: all 0.3s ease;
-    }
-    
-    .stDownloadButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 8px 32px rgba(79, 172, 254, 0.4);
-    }
-    
-    /* Input styling */
-    .stSelectbox > div > div {
-        background: rgba(255, 255, 255, 0.9);
         border-radius: 10px;
-        border: 2px solid rgba(255, 255, 255, 0.5);
-        backdrop-filter: blur(10px);
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        margin: 1rem 0;
     }
     
-    .stNumberInput > div > div > input {
-        background: rgba(255, 255, 255, 0.9);
-        border-radius: 10px;
-        border: 2px solid rgba(255, 255, 255, 0.5);
-        backdrop-filter: blur(10px);
+    .success-message {
+        background: #d4edda;
+        border: 1px solid #c3e6cb;
+        color: #155724;
+        padding: 1rem;
+        border-radius: 5px;
+        margin: 1rem 0;
+    }
+    
+    .info-card {
+        background: #e3f2fd;
+        border-left: 4px solid #2196f3;
+        padding: 1rem;
+        margin: 1rem 0;
+        border-radius: 5px;
     }
     
     /* Sidebar styling */
-    .css-1d391kg {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    .sidebar .sidebar-content {
+        background: linear-gradient(180deg, #f8f9fa, #e9ecef);
     }
     
-    /* Hide streamlit branding */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    .stDeployButton {display: none;}
-    </style>
-    """, unsafe_allow_html=True)
-
-def create_header():
-    st.markdown("""
-    <div class="main-header">
-        <h1>📈 NSE Stock Analysis Dashboard</h1>
-        <p>Real-time Price vs Delivery Percentage Analysis</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-def create_control_panel(symbols):
-    st.markdown('<div class="control-panel">', unsafe_allow_html=True)
+    /* Table styling enhancements - frozen first column */
+    .dataframe {
+        border: 1px solid #dee2e6;
+        border-radius: 5px;
+        overflow-x: auto;
+    }
     
-    col1, col2, col3 = st.columns([2, 1, 1])
+    /* Enhanced frozen column styling */
+    div[data-testid="stDataFrame"] table {
+        position: relative;
+    }
     
-    with col1:
-        symbol = st.selectbox(
-            "🏢 Select NSE Symbol",
-            options=symbols,
-            index=(symbols.index("RELIANCE") if "RELIANCE" in symbols else 0),
-            help="Choose from all NSE listed equity symbols"
-        )
+    div[data-testid="stDataFrame"] table thead th:first-child,
+    div[data-testid="stDataFrame"] table tbody td:first-child {
+        position: sticky !important;
+        left: 0 !important;
+        z-index: 10 !important;
+        background: #ffffff !important;
+        border-right: 3px solid #2e7d32 !important;
+        box-shadow: 2px 0 5px rgba(0,0,0,0.1) !important;
+    }
     
-    with col2:
-        days = st.number_input(
-            "📅 Days to Analyze", 
-            min_value=1, 
-            max_value=365, 
-            value=30,
-            help="Number of business days to fetch"
-        )
+    div[data-testid="stDataFrame"] table thead th:first-child {
+        background: #2e7d32 !important;
+        color: white !important;
+        font-weight: bold !important;
+    }
     
-    with col3:
-        st.markdown("<br>", unsafe_allow_html=True)  # spacing
-        analyze_btn = st.button("🚀 Analyze Stock", use_container_width=True)
+    div[data-testid="stDataFrame"] table tbody td:first-child {
+        background: #f8f9fa !important;
+        font-weight: 600 !important;
+        color: #1b5e20 !important;
+    }
     
-    st.markdown('</div>', unsafe_allow_html=True)
+    /* Custom button styling */
+    .stButton > button {
+        background: linear-gradient(90deg, #2e7d32, #388e3c);
+        color: white;
+        border: none;
+        border-radius: 5px;
+        padding: 0.5rem 1rem;
+        font-weight: 600;
+    }
     
-    return symbol, days, analyze_btn
+    .stButton > button:hover {
+        background: linear-gradient(90deg, #1b5e20, #2e7d32);
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+    }
+    
+    /* Reduce top padding */
+    .main .block-container {
+        padding-top: 1rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-def create_metrics_display(avg_price, avg_delivery, high_price, low_price, volatility):
-    st.markdown("""
-    <div class="metric-container">
-        <div class="metric-grid">
-            <div class="metric-card">
-                <div class="metric-label">Average Price</div>
-                <div class="metric-value price">₹{:.2f}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Average Delivery %</div>
-                <div class="metric-value percentage">{:.2f}%</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Highest Price</div>
-                <div class="metric-value price">₹{:.2f}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Lowest Price</div>
-                <div class="metric-value price">₹{:.2f}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Volatility (σ)</div>
-                <div class="metric-value volatility">₹{:.2f}</div>
-            </div>
-        </div>
-    </div>
-    """.format(avg_price, avg_delivery, high_price, low_price, volatility), unsafe_allow_html=True)
+# NSE index constituents CSVs
+INDEX_URLS = {
+    "NIFTY50": "https://archives.nseindia.com/content/indices/ind_nifty50list.csv",
+    "NIFTY100": "https://archives.nseindia.com/content/indices/ind_nifty100list.csv",
+    "NIFTY200": "https://archives.nseindia.com/content/indices/ind_nifty200list.csv",
+    "NIFTY500": "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
+}
 
-# ===== Streamlit UI =====
-st.set_page_config(
-    page_title="NSE Stock Analysis Dashboard", 
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def get_index_members(index_name: str) -> set:
+    """Fetch and cache the latest index constituents for the given index."""
+    index_key = (index_name or "").upper()
+    url = INDEX_URLS.get(index_key)
+    if not url:
+        return set()
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        resp.raise_for_status()
+        df_idx = pd.read_csv(io.StringIO(resp.text))
+    except Exception:
+        return set()
+    
+    # Resolve symbol column name
+    symbol_col = None
+    for c in ["Symbol", "SYMBOL", "symbol"]:
+        if c in df_idx.columns:
+            symbol_col = c
+            break
+    if symbol_col is None:
+        for c in df_idx.columns:
+            if "symbol" in str(c).lower():
+                symbol_col = c
+                break
+    if symbol_col is None:
+        return set()
+    return set(df_idx[symbol_col].astype(str).str.upper().str.strip())
 
-# Apply custom styling
-apply_custom_css()
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def get_symbol_to_name_map() -> dict:
+    """Return mapping SYMBOL -> NAME OF COMPANY from NSE equity master."""
+    try:
+        url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text))
+    except Exception:
+        return {}
+    
+    symbol_col = None
+    name_col = None
+    for col in df.columns:
+        low = str(col).lower()
+        if symbol_col is None and low.startswith("symbol"):
+            symbol_col = col
+        if name_col is None and ("name" in low and "company" in low):
+            name_col = col
+    if not symbol_col or not name_col:
+        return {}
+    
+    df = df[[symbol_col, name_col]].dropna()
+    df[symbol_col] = df[symbol_col].astype(str).str.upper().str.strip()
+    return dict(zip(df[symbol_col], df[name_col].astype(str)))
 
-# Create beautiful header
-create_header()
-
-# Load symbols with spinner
-with st.spinner("🔄 Loading NSE symbols..."):
-    symbols = load_symbol_list()
-
-# Control panel
-symbol, days, analyze_btn = create_control_panel(symbols)
-
-# Analysis section
-if analyze_btn:
-    with st.spinner(f"📊 Fetching data for {symbol}..."):
-        vis = NSEVisualizer()
-        end_dt = datetime.now()
-        # Use business-day offset for more accurate trading window
-        start_dt = (pd.Timestamp(end_dt) - pd.tseries.offsets.BDay(int(days))).to_pydatetime()
-        df = vis.fetch_data(symbol, start_dt, end_dt)
-
-    if df.empty:
-        st.error("❌ No data found for the selected symbol and date range. Please try different parameters.")
-    else:
-        st.success(f"✅ Successfully fetched {len(df)} trading days for **{symbol}**")
-
-        # Determine price column and summary stats (capital market bhav uses CLOSE)
-        price_col = "CLOSE" if "CLOSE" in df.columns else ("CLOSE_PRICE" if "CLOSE_PRICE" in df.columns else None)
-        if price_col is None:
-            st.error("❌ Price column not found in data returned by NSE.")
-        else:
-            price_series = pd.to_numeric(df[price_col], errors="coerce")
-            avg_price = price_series.mean()
-            avg_delivery = pd.to_numeric(df["DELIVERY_PCT"], errors="coerce").mean()
-            high_price = price_series.max()
-            low_price = price_series.min()
-            volatility = price_series.std()
-
-        # Display beautiful metrics
-        create_metrics_display(avg_price, avg_delivery, high_price, low_price, volatility)
-
-        # Interactive dual-axis Plotly chart with enhanced styling
-        st.markdown('<div class="chart-container">', unsafe_allow_html=True)
-        
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        
-        # Enhanced price line with gradient colors
-        if price_col is not None:
-            fig.add_trace(
-                go.Scatter(
-                    x=df["DATE"],
-                    y=pd.to_numeric(df[price_col], errors="coerce"),
-                    mode="lines+markers",
-                    name="Close Price",
-                    line=dict(
-                        color="#667eea", 
-                        width=4,
-                        shape="spline",
-                        smoothing=0.3
-                    ),
-                    marker=dict(
-                        size=6,
-                        color="#764ba2",
-                        line=dict(width=2, color="white")
-                    ),
-                    hovertemplate="<b>%{x|%d %b %Y}</b><br>Close: ₹%{y:.2f}<extra></extra>",
-                    fill="tonexty" if len(df) > 1 else None,
-                    fillcolor="rgba(102, 126, 234, 0.1)"
-                ),
-                secondary_y=False,
-            )
-        
-        # Enhanced delivery % bars with conditional coloring
-        delivery_values = pd.to_numeric(df["DELIVERY_PCT"], errors="coerce")
-        bar_colors = []
-        for val in delivery_values:
-            if pd.isna(val):
-                bar_colors.append("#cccccc")  # Gray for missing data
-            elif val > 70:
-                bar_colors.append("#2ecc71")  # Bright Green for >70%
-            elif val >= 50:
-                bar_colors.append("#f39c12")  # Orange-Yellow for 50-70%
-            else:
-                bar_colors.append("#e74c3c")  # Red for <50%
-        
-        fig.add_trace(
-            go.Bar(
-                x=df["DATE"],
-                y=delivery_values,
-                name="Delivery %",
-                marker=dict(
-                    color=bar_colors,
-                    opacity=0.8,
-                    line=dict(width=1, color="white")
-                ),
-                hovertemplate="<b>%{x|%d %b %Y}</b><br>Delivery: %{y:.2f}%<extra></extra>",
-            ),
-            secondary_y=True,
-        )
-
-        # Enhanced layout with modern styling
-        price_values = pd.to_numeric(df[price_col], errors="coerce") if price_col else pd.Series([])
-        if not price_values.empty:
-            price_min = price_values.min()
-            price_max = price_values.max()
-            price_range = price_max - price_min
-            price_buffer = max(price_range * 0.05, 10)  # 5% buffer or minimum 10 rupees
-        else:
-            price_min, price_max, price_buffer = 0, 100, 10
-        
-        fig.update_layout(
-            title=dict(
-                text=f"<b>{symbol}</b> - Price vs Delivery % Analysis",
-                font=dict(size=24, color="#2c3e50"),
-                x=0.5
-            ),
-            template="plotly_white",
-            legend=dict(
-                x=0.02, y=0.98, 
-                orientation="v",
-                bgcolor="rgba(255, 255, 255, 0.8)",
-                bordercolor="rgba(0, 0, 0, 0.1)",
-                borderwidth=1,
-                font=dict(size=12)
-            ),
-            hovermode="x unified",
-            bargap=0.2,
-            xaxis=dict(
-                title="<b>Date</b>", 
-                showgrid=True,
-                gridcolor="rgba(0, 0, 0, 0.1)"
-            ),
-            uirevision="keep",  # keep zoom/selection when rerunning
-            plot_bgcolor="rgba(255, 255, 255, 0.8)",
-            paper_bgcolor="rgba(255, 255, 255, 0.9)",
-            height=600
-        )
-        
-        fig.update_yaxes(
-            title_text="<b>Close Price (₹)</b>", 
-            secondary_y=False,
-            showgrid=True,
-            gridcolor="rgba(102, 126, 234, 0.2)",
-            range=[price_min - price_buffer, price_max + price_buffer]
-        )
-        fig.update_yaxes(
-            title_text="<b>Delivery %</b>", 
-            secondary_y=True,
-            showgrid=False,
-            range=[0, 100]  # Keep delivery % range fixed at 0-100%
-        )
-
-        # Remove gaps for weekends and NSE holidays not present in data
-        try:
-            observed = pd.to_datetime(df["DATE"]).dt.normalize().unique()
-            all_days = pd.date_range(pd.to_datetime(df["DATE"]).min().normalize(), pd.to_datetime(df["DATE"]).max().normalize(), freq="D")
-            missing = [d for d in all_days if d.to_datetime64() not in set(observed)]
-            fig.update_xaxes(rangebreaks=[
-                dict(bounds=["sat", "mon"]),  # hide weekends
-                dict(values=missing),           # hide other missing dates (holidays)
-            ])
-        except Exception:
-            pass
-
-        st.plotly_chart(fig, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        # Enhanced download section
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "📥 Download Data as CSV",
-                csv, 
-                f"{symbol}_price_delivery_{datetime.now().strftime('%Y%m%d')}.csv", 
-                "text/csv",
-                use_container_width=True
-            )
-
-# Footer
+# Compact header - reduced padding
 st.markdown("""
----
-<div style="text-align: center; color: #666; padding: 2rem;">
-    <p><i>Soli Deo Gloria</i></p>
+<div style="background: linear-gradient(90deg, #1f4e79, #2e7d32); padding: 0.8rem; border-radius: 8px; margin-bottom: 1rem;">
+    <h2 style="color: white; margin: 0; font-size: 1.8rem;">📈 NSE Bhavcopy Viewer</h2>
+    <p style="color: #e8f5e8; margin: 0.2rem 0 0 0; font-size: 0.9rem;">Daily equity stock data from NSE</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Enhanced sidebar - removed quick select buttons
+with st.sidebar:
+    st.markdown("## 📅 Date Selection")
+    selected_date = st.date_input(
+        "Select a trading date",
+        value=date.today(),
+        max_value=date.today(),
+        help="Select a date to fetch Bhavcopy data. Data is typically available after market hours.",
+        key="bhavcopy_date_input",
+    )
+    
+    # Add market status indicator
+    st.markdown("---")
+    st.markdown("### 🕐 Market Status")
+    now = datetime.datetime.now()
+    if now.weekday() < 5:  # Monday to Friday
+        market_time = now.time()
+        if datetime.time(9, 15) <= market_time <= datetime.time(15, 30):
+            st.success("🟢 Market Open")
+        else:
+            st.info("🔵 Market Closed")
+    else:
+        st.error("🔴 Weekend")
+
+# Compact main content area
+col_left, col_right = st.columns([4, 1])
+with col_left:
+    st.markdown(f"### 📊 Bhavcopy Data - {selected_date.strftime('%d %B, %Y')}")
+with col_right:
+    st.metric("📅 Date", selected_date.strftime('%d-%b-%Y'))
+
+# Compact market hours warning
+if selected_date == date.today():
+    now = datetime.datetime.now().time()
+    market_open = datetime.time(9, 15)
+    market_close = datetime.time(15, 30)
+    if market_open <= now <= market_close:
+        st.warning("⚠️ Market is open. Data may not be available yet.")
+    elif now < market_open:
+        st.info("ℹ️ Market hasn't opened. Previous day's data shown if available.")
+
+# Fetch and display data
+try:
+    with st.spinner("🔄 Fetching Bhavcopy data..."):
+        qdate = selected_date.strftime('%d-%m-%Y')
+        df = capital_market.bhav_copy_with_delivery(qdate)
+
+        if df is None or df.empty:
+            # Enhanced error handling
+            st.error("❌ **No data available for the selected date.**")
+            
+            with st.expander("💡 **Troubleshooting Tips**", expanded=True):
+                st.markdown("""
+                **Possible reasons:**
+                - 📅 Selected date is a weekend or market holiday
+                - ⏰ Data is not yet available (market may still be open)
+                - 🔧 NSE servers are temporarily unavailable
+                - 📊 No trading occurred on this date
+                """)
+                
+                if selected_date.weekday() >= 5:
+                    prev_working_day = selected_date - timedelta(days=selected_date.weekday() - 4)
+                    st.info(f"**Suggestion:** Try selecting {prev_working_day.strftime('%d-%b-%Y')} (Previous Friday)")
+                elif selected_date == date.today():
+                    prev_day = selected_date - timedelta(days=1)
+                    st.info(f"**Suggestion:** Try selecting {prev_day.strftime('%d-%b-%Y')} (Previous day)")
+        else:
+            # Compact success message
+            st.success(f"✅ Fetched data for {len(df)} stocks on {selected_date.strftime('%d-%b-%Y')}")
+
+            # Data transformation - Updated column order as per requirements
+            display_df = pd.DataFrame()
+            
+            # Get company names mapping
+            symbol_to_name = get_symbol_to_name_map()
+            display_df['Stock Name'] = (
+                df['SYMBOL'].astype(str).str.upper().map(symbol_to_name)
+                .fillna(df['SYMBOL'])
+            )
+            
+            display_df['% Price Change'] = (
+                (df['CLOSE_PRICE'] - df['PREV_CLOSE']) / df['PREV_CLOSE'] * 100
+            ).round(2)
+            display_df['% Delivery'] = pd.to_numeric(df['DELIV_PER'], errors='coerce').fillna(0).round(2)
+            display_df['Total Volume Traded'] = df['TTL_TRD_QNTY'].astype(int)
+            display_df["Close Price"] = df['CLOSE_PRICE'].round(2)
+            display_df['Previous Close Price'] = df['PREV_CLOSE'].round(2)
+            
+            # Keep symbol for filtering purposes (not displayed in main table)
+            display_df['Symbol'] = df['SYMBOL']
+            display_df['Date'] = pd.to_datetime(df['DATE1'], format='%d-%b-%Y').dt.strftime('%d-%m-%Y')
+            display_df['Delivered Qty'] = pd.to_numeric(df['DELIV_QTY'], errors='coerce').fillna(0).astype(int)
+            display_df['Turnover (₹ Cr)'] = (df['TURNOVER_LACS'] / 100).round(2)
+            display_df = display_df.fillna(0)
+
+            # Enhanced filters section as per requirements
+            st.markdown("### 🔍 Filters")
+            
+            with st.expander("🎛️ Filter Options", expanded=True):
+                f1, f2, f3, f4 = st.columns(4)
+                
+                with f1:
+                    st.markdown("**📈 % Change**")
+                    min_chg = st.number_input(
+                        "Min % Change",
+                        min_value=float(display_df['% Price Change'].min()),
+                        max_value=float(display_df['% Price Change'].max()),
+                        value=float(display_df['% Price Change'].min()),
+                        step=0.5,
+                        format="%.1f",
+                        help="Filter stocks by minimum price change percentage"
+                    )
+                    max_chg = st.number_input(
+                        "Max % Change",
+                        min_value=float(display_df['% Price Change'].min()),
+                        max_value=float(display_df['% Price Change'].max()),
+                        value=float(display_df['% Price Change'].max()),
+                        step=0.5,
+                        format="%.1f",
+                        help="Filter stocks by maximum price change percentage"
+                    )
+                
+                with f2:
+                    st.markdown("**📦 % Delivery**")
+                    min_del = st.number_input(
+                        "Min % Delivery",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=0.0,
+                        step=5.0,
+                        format="%.0f",
+                        help="Filter stocks by minimum delivery percentage"
+                    )
+                    max_del = st.number_input(
+                        "Max % Delivery",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=100.0,
+                        step=5.0,
+                        format="%.0f",
+                        help="Filter stocks by maximum delivery percentage"
+                    )
+                
+                with f3:
+                    st.markdown("**🎯 Indices**")
+                    index_choice = st.selectbox(
+                        "Select Index",
+                        options=["All Stocks", "NIFTY50", "NIFTY100", "NIFTY200", "NIFTY500"],
+                        index=0,
+                        help="Filter stocks by index membership"
+                    )
+                
+                with f4:
+                    st.markdown("**🔍 Stock Search**")
+                    stock_search = st.text_input(
+                        "Search Stock",
+                        placeholder="e.g., RELIANCE, TCS, HDFC",
+                        help="Search by stock symbol or company name"
+                    )
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            # Apply filters as per requirements
+            filtered_df = display_df[
+                (display_df['% Price Change'] >= min_chg) &
+                (display_df['% Price Change'] <= max_chg) &
+                (display_df['% Delivery'] >= min_del) &
+                (display_df['% Delivery'] <= max_del)
+            ].copy()
+            
+            # Stock search filter - search both symbol and company name
+            if stock_search:
+                search_mask = (
+                    filtered_df['Symbol'].str.contains(stock_search.upper(), na=False) |
+                    filtered_df['Stock Name'].str.contains(stock_search.upper(), case=False, na=False)
+                )
+                filtered_df = filtered_df[search_mask]
+            
+            # Index filter
+            if index_choice and index_choice != "All Stocks":
+                members = get_index_members(index_choice)
+                if members:
+                    filtered_df = filtered_df[
+                        filtered_df['Symbol'].str.upper().isin(members)
+                    ]
+                else:
+                    st.warning(f"⚠️ Could not fetch {index_choice} constituent list. Showing all stocks.")
+
+            # Compact metrics dashboard
+            m1, m2, m3, m4, m5 = st.columns(5)
+            
+            with m1:
+                st.metric("📈 Stocks", f"{len(filtered_df):,}")
+            with m2:
+                avg_change = filtered_df['% Price Change'].mean()
+                st.metric("📊 Avg Change", f"{avg_change:.1f}%")
+            with m3:
+                avg_delivery = filtered_df['% Delivery'].mean()
+                st.metric("📦 Avg Delivery", f"{avg_delivery:.1f}%")
+            with m4:
+                total_volume = filtered_df['Total Volume Traded'].sum()
+                st.metric("📊 Volume", f"{total_volume/1e7:.1f}Cr")
+            with m5:
+                total_turnover = filtered_df['Turnover (₹ Cr)'].sum()
+                st.metric("💰 Turnover", f"₹{total_turnover:,.0f}Cr")
+
+            # Enhanced data table with custom column order
+            st.markdown("### 📋 Stock Data Table")
+            
+            # Pagination and sorting controls
+            pc1, pc2, pc3 = st.columns([1, 1, 1])
+            with pc1:
+                page_size = st.selectbox(
+                    "📄 Rows per page", 
+                    [25, 50, 100, 200], 
+                    index=1,
+                    help="Select number of rows to display per page"
+                )
+            with pc2:
+                sort_by = st.selectbox(
+                    "🔤 Sort by", 
+                    ['% Price Change', 'Total Volume Traded', '% Delivery', 'Close Price', 'Stock Name'],
+                    help="Choose column to sort by"
+                )
+            with pc3:
+                sort_order = st.selectbox(
+                    "📶 Sort order", 
+                    ['Descending', 'Ascending'],
+                    help="Choose sort direction"
+                )
+
+            # Apply sorting
+            ascending = sort_order == 'Ascending'
+            filtered_df = filtered_df.sort_values(by=sort_by, ascending=ascending)
+
+            # Pagination
+            total_rows = len(filtered_df)
+            num_pages = (total_rows + page_size - 1) // page_size
+            
+            if num_pages > 1:
+                page = st.selectbox(
+                    f"📖 Page (1 to {num_pages})", 
+                    range(1, num_pages + 1), 
+                    index=0,
+                    help=f"Navigate through {num_pages} pages of data"
+                )
+                start_idx = (page - 1) * page_size
+                end_idx = min(start_idx + page_size, total_rows)
+                page_df = filtered_df.iloc[start_idx:end_idx]
+                st.info(f"📄 Showing rows **{start_idx + 1}** to **{end_idx}** of **{total_rows:,}** filtered results")
+            else:
+                page_df = filtered_df
+                st.info(f"📄 Showing all **{total_rows:,}** filtered results")
+
+            # Display dataframe with custom column order - Stock Name will be frozen
+            display_columns = ['Stock Name', '% Price Change', '% Delivery', 'Total Volume Traded', 'Close Price', 'Previous Close Price']
+            page_display_df = page_df[display_columns]
+
+            # Enhanced dataframe display with frozen first column
+            st.dataframe(
+                page_display_df,
+                use_container_width=True,
+                column_config={
+                    "Stock Name": st.column_config.TextColumn(
+                        "🏢 Stock Name",
+                        help="Company name (frozen column)",
+                        width="large"
+                    ),
+                    "% Price Change": st.column_config.NumberColumn(
+                        "📈 % Price Change",
+                        help="Percentage price change from previous close",
+                        format="%.2f%%"
+                    ),
+                    "% Delivery": st.column_config.NumberColumn(
+                        "📦 % Delivery",
+                        help="Delivery percentage",
+                        format="%.2f%%"
+                    ),
+                    "Total Volume Traded": st.column_config.NumberColumn(
+                        "📊 Total Volume Traded",
+                        help="Total traded volume",
+                        format="%,d"
+                    ),
+                    "Close Price": st.column_config.NumberColumn(
+                        "💰 Close Price",
+                        help="Today's closing price",
+                        format="₹%.2f"
+                    ),
+                    "Previous Close Price": st.column_config.NumberColumn(
+                        "📊 Previous Close Price",
+                        help="Previous day's closing price",
+                        format="₹%.2f"
+                    ),
+                },
+                height=600
+            )
+
+            # Enhanced download section
+            st.markdown("### 📥 Export Data")
+            dl1, dl2, dl3 = st.columns(3)
+            
+            with dl1:
+                csv_data = filtered_df[display_columns].to_csv(index=False)
+                st.download_button(
+                    label="📊 Download Filtered CSV",
+                    data=csv_data,
+                    file_name=f"nse_bhavcopy_filtered_{selected_date.strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            
+            with dl2:
+                full_csv = display_df[display_columns].to_csv(index=False)
+                st.download_button(
+                    label="📈 Download Complete CSV",
+                    data=full_csv,
+                    file_name=f"nse_bhavcopy_complete_{selected_date.strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            
+            with dl3:
+                # Top performers CSV (top 100 by % change)
+                top_performers = display_df.nlargest(100, '% Price Change')[display_columns]
+                top_csv = top_performers.to_csv(index=False)
+                st.download_button(
+                    label="🏆 Download Top 100 Performers",
+                    data=top_csv,
+                    file_name=f"nse_top_performers_{selected_date.strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+            # Summary statistics
+            st.markdown('<div class="info-card">', unsafe_allow_html=True)
+            st.markdown(f"""
+            ### 📊 **Data Summary**
+            - **Original Dataset:** {len(display_df):,} stocks  
+            - **Filtered Dataset:** {len(filtered_df):,} stocks  
+            - **Filter Efficiency:** {(len(filtered_df)/len(display_df)*100):.1f}% of total data
+            - **Date:** {selected_date.strftime('%A, %d %B %Y')}
+            """)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+except Exception as e:
+    st.error(f"❌ **Error fetching Bhavcopy data:** {str(e)}")
+    
+    with st.expander("🔍 **Error Details & Solutions**", expanded=True):
+        error_msg = str(e)
+        st.code(error_msg)
+        
+        st.markdown("""
+        ### 💡 **Possible Solutions:**
+        1. **Check Internet Connection** - Ensure stable internet connectivity
+        2. **Try Different Date** - Select a previous trading day
+        3. **Server Issues** - NSE servers might be temporarily unavailable
+        4. **Library Issues** - nselib package might need updating
+        """)
+
+# Enhanced footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; padding: 1.5rem; background: #f8f9fa; border-radius: 10px; margin-top: 1rem;'>
+    <h4>📊 NSE Bhavcopy Viewer</h4>
+    <p><strong>Data Source:</strong> National Stock Exchange (NSE) via nselib package</p>
+    <p><strong>Note:</strong> Bhavcopy data is typically available after market hours (3:30 PM IST)</p>
+    <p><em>Soli Deo Gloria</em></p>
 </div>
 """, unsafe_allow_html=True)
